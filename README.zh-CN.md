@@ -35,8 +35,8 @@
 ## 快速开始
 
 ```ts
-import { create } from "@gm/state";
-import { useStore } from "@gm/state/react";
+import { create } from "@gmonking/state";
+import { useStore } from "@gmonking/state/react";
 
 export const count = create(0);
 
@@ -67,7 +67,7 @@ function Counter() {
 
 ```ts
 // stores.ts
-import { create } from "@gm/state";
+import { create } from "@gmonking/state";
 
 export const user = create({ name: "guest" });
 export const count = create(0);
@@ -76,7 +76,7 @@ export const count = create(0);
 错误示例：
 
 ```ts
-import { create } from "@gm/state";
+import { create } from "@gmonking/state";
 
 export function makeStore() {
   return create(0);

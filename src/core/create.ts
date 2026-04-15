@@ -18,12 +18,19 @@ type StoreSetProducer<T> = (value: T) => T;
 
 type StoreSetFunc<T> = (producer: T | StoreSetProducer<T>) => void;
 
+type StoreInitializer<T> = () => T | Promise<T>;
+
 export type StoreLike<T> = {
   _getServerSnapshot: () => T;
   setServerValue: (value: T) => void;
   getSnapshot: () => T;
   setValue: StoreSetFunc<T>;
   subscribe: StoreSubscribe<T>;
+  /**
+   * Register an initializer that runs whenever the first subscriber appears.
+   * The initializer may be async; its resolved return value becomes the new state.
+   */
+  init: (initializer: StoreInitializer<T>) => void;
 };
 
 type EffectDeps = Record<string, StoreLike<any>>;
@@ -320,6 +327,9 @@ function createEffectManager() {
 export function create<T>(producer: StoreCreateProducer<T> | T) {
   const storeId = generateStoreId();
   let selfStore: StoreLike<T> | null = null;
+  let initializer: StoreInitializer<T> | null = null;
+  let initCycle = 0;
+  let initStartedForCycle = false;
 
   // 初始化状态
   const initialState = initializeState(producer);
@@ -432,6 +442,31 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
     }
   };
 
+  const applyInitValue = (value: T): void => {
+    // If there are no listeners by the time init resolves, follow idle semantics:
+    // cache it so the next subscription restores it.
+    if (listenerManager.isEmpty()) {
+      lastSetValueOnIdle = () => value;
+      return;
+    }
+
+    // Switch to client state and notify subscribers with the resolved value.
+    stateManager.switchToClientState();
+    stateManager.setState(value);
+
+    syncUpdateDepth += 1;
+    if (syncUpdateDepth === 1) syncUpdateNotifyCount = 0;
+    try {
+      syncUpdateNotifyCount += 1;
+      if (syncUpdateNotifyCount > MAX_SYNC_NOTIFIES) {
+        throw new Error("同步更新次数过多，可能存在依赖成环导致的无限更新");
+      }
+      listenerManager.notify(value, (l) => withListenerContext(storeId, () => l(value)));
+    } finally {
+      syncUpdateDepth -= 1;
+    }
+  };
+
   const subscribe: StoreSubscribe<T> = (listener) => {
     // 服务端不会执行 subscribe
     if (isServer) return () => {};
@@ -443,6 +478,10 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
 
     // 当第一个监听者出现时，初始化订阅
     if (listenerManager.size === 1) {
+      // 每个订阅周期（从 0 listeners -> 1 listener）都重置 init 标记
+      initCycle += 1;
+      initStartedForCycle = false;
+
       // 如果状态已被重置（没有监听者时会被重置），重新初始化
       if (stateManager.getState() === RESET && stateManager.getServerValue() === RESET) {
         const newInitialState = initializeState(producer);
@@ -463,6 +502,22 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
       // 执行首次回调和开始订阅依赖
       effectManager.executeFirstCallbacks();
       effectManager.startSubscriptions();
+
+      // 首个订阅者出现时执行 initializer（允许 async）
+      if (initializer && !initStartedForCycle) {
+        initStartedForCycle = true;
+        const cycleAtStart = initCycle;
+        Promise.resolve()
+          .then(() => initializer!())
+          .then((value) => {
+            // 已进入新周期则忽略旧结果
+            if (cycleAtStart !== initCycle) return;
+            applyInitValue(value);
+          })
+          .catch(() => {
+            // swallow to avoid unhandled rejection; consumer can handle errors upstream
+          });
+      }
     }
 
     // 立即通知监听者当前状态
@@ -586,6 +641,9 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
     setValue,
     setServerValue,
     _getServerSnapshot,
+    init: (fn: StoreInitializer<T>) => {
+      initializer = fn;
+    },
   } as const;
 
   selfStore = store;
