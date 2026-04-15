@@ -1,0 +1,36 @@
+{
+  "name": "state",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js"
+    }
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && vite build",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "use-sync-external-store": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.6",
+    "@types/use-sync-external-store": "^1.5.0",
+    "typescript": "~5.9.3",
+    "use-sync-external-store": "^1.6.0",
+    "vite": "npm:rolldown-vite@7.2.5",
+    "vitest": "^3.2.4"
+  },
+  "overrides": {
+    "vite": "npm:rolldown-vite@7.2.5"
+  }
+}
