@@ -11,13 +11,16 @@ This repo is currently marked `"private": true` in `package.json`. If you plan t
 
 ## API
 
-### `create(initial | () => initial)`
+### `create(initial | () => initial, options?)`
 
 Creates a store.
 
 - `getSnapshot(): T`
 - `subscribe(listener: (value: T) => void): () => void`
   - **Immediately** calls `listener(getSnapshot())` once on subscribe.
+- `init(initializer: () => T | Promise<T>): void`
+  - Runs when the **first subscriber appears** (per subscription cycle)
+  - The resolved return value becomes the new state and will notify subscribers once
 - `setValue(next: T | ((prev: T) => T)): void`
   - No-op on server (`isServer === true`)
 - `setServerValue(value: T): void`
@@ -29,11 +32,32 @@ Creates a store.
   - `listener(depValues, setSelf)`
   - `options`: `{ allowCycle?: boolean }`
 
+Options:
+
+- `idleMs?: number` — delay going fully idle/reset after the last subscriber unsubscribes (default: `0`)
+
 ### React
 
 From `./react` export:
 
 - `useStore(store)` → returns `[value, setValue] as const`
+
+## Recommended usage with React
+
+When used with React, the most common APIs are:
+
+- `create()` to define stores (top-level)
+- `useStore()` to read state in components
+- `store.effect()` to express derived state / business logic driven by dependencies
+- `store.init()` to load/initialize state on first subscription (per subscription cycle)
+
+**Lifecycle model:**
+
+- In React, components call `useStore(store)` to subscribe and read values
+- Updating state happens by calling methods on the store (primarily `setValue`, or logic inside `effect/init`)
+- When a component unmounts, React automatically unsubscribes (via `useSyncExternalStore`)
+- When no components subscribe to a store, the store becomes **idle/sleeping** (no listeners)
+- When the first subscriber appears again, `init()` will run (if registered) and the store wakes up
 
 ## Quick start
 
@@ -100,6 +124,14 @@ export const maybe = Math.random() > 0.5 ? create(1) : create(2);
 ### Idle updates
 
 When a store has **no subscribers**, `setValue()` does not notify anyone. The latest idle update is applied when the store gets its next subscriber.
+
+### Initialization on first subscriber (`init`)
+
+You can register an initializer that runs whenever the store gets its **first** subscriber (including after all subscribers have unsubscribed and later a new one appears).
+
+- The initializer can be async
+- Subscribe still **immediately emits** the current value first
+- When the initializer resolves, its return value becomes the new state and subscribers get notified once
 
 ### Listener re-entrancy is forbidden
 

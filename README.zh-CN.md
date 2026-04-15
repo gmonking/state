@@ -8,13 +8,16 @@
 
 ## API
 
-### `create(initial | () => initial)`
+### `create(initial | () => initial, options?)`
 
 创建一个 store。
 
 - `getSnapshot(): T`
 - `subscribe(listener: (value: T) => void): () => void`
   - **订阅时立即**调用一次 `listener(getSnapshot())`
+- `init(initializer: () => T | Promise<T>): void`
+  - 每次“**第一个订阅者出现**”时执行（每个订阅周期一次）
+  - 支持异步函数；resolve 的返回值会成为新状态，并通知订阅者一次
 - `setValue(next: T | ((prev: T) => T)): void`
   - 服务端（`isServer === true`）是 no-op
 - `setServerValue(value: T): void`
@@ -26,11 +29,32 @@
   - `listener(depValues, setSelf)`
   - `options`: `{ allowCycle?: boolean }`
 
+可选参数：
+
+- `idleMs?: number` — 当最后一个订阅者取消订阅后，延迟进入“休眠/重置”的时间（默认：`0`，立即休眠）
+
 ### React
 
 从 `./react` 导出：
 
 - `useStore(store)` → 返回 `[value, setValue] as const`
+
+## 与 React 结合的推荐用法
+
+当你在 React 中使用时，最常用的 API 通常是：
+
+- `create()`：在模块顶层定义 store
+- `useStore()`：在组件中读取状态
+- `store.effect()`：基于依赖链表达派生状态/业务逻辑
+- `store.init()`：在“首个订阅者出现”时初始化（每个订阅周期一次）
+
+**生命周期心智模型：**
+
+- 在 React 中，组件通过 `useStore(store)` 订阅并获取状态值
+- 状态变更通过调用 store 的方法触发（主要是 `setValue`，或由 `effect/init` 内部逻辑驱动）
+- 组件卸载时会自动退订（`useSyncExternalStore` 会处理）
+- 当没有组件订阅某个 store 时，该 store 进入 **休眠/idle**（无 listener）
+- 当新的首个订阅者出现时（包括“全部退订后再次订阅”），如果注册了 `init()`，会触发初始化并唤醒 store
 
 ## 快速开始
 
@@ -97,6 +121,14 @@ export const maybe = Math.random() > 0.5 ? create(1) : create(2);
 ### Idle 更新
 
 当 store **没有订阅者** 时，`setValue()` 不会通知任何人。最新的一次 idle 更新会在下次 `subscribe()` 时（立即通知阶段）生效。
+
+### 首订阅初始化（`init`）
+
+你可以注册一个初始化函数：当 store 出现**第一个订阅者**时执行一次（包括“全部退订后又出现新的订阅者”的情况）。
+
+- 初始化函数可以是 async
+- `subscribe` 仍然会先**立即**推送当前值
+- 初始化函数 resolve 后，其返回值会成为新状态，并通知订阅者一次
 
 ### 禁止 listener 重入（re-entrancy）
 

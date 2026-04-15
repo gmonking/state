@@ -33,6 +33,16 @@ export type StoreLike<T> = {
   init: (initializer: StoreInitializer<T>) => void;
 };
 
+type CreateOptions = {
+  /**
+   * Delay going fully idle (clearing effect subscriptions + resetting state) after
+   * the last subscriber unsubscribes. Helps avoid subscribe/unsubscribe thrash in React.
+   *
+   * Default: 0 (immediate idle/reset)
+   */
+  idleMs?: number;
+};
+
 type EffectDeps = Record<string, StoreLike<any>>;
 
 type EffectDepValueOf<R> = R extends { getSnapshot: () => infer S } ? S : never;
@@ -324,12 +334,17 @@ function createEffectManager() {
 // 主函数
 // ============================================================================
 
-export function create<T>(producer: StoreCreateProducer<T> | T) {
+export function create<T>(producer: StoreCreateProducer<T> | T, options?: CreateOptions) {
   const storeId = generateStoreId();
   let selfStore: StoreLike<T> | null = null;
   let initializer: StoreInitializer<T> | null = null;
   let initCycle = 0;
   let initStartedForCycle = false;
+  let isActive = false;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  let idleMs = 0;
+
+  idleMs = options?.idleMs ?? 0;
 
   // 初始化状态
   const initialState = initializeState(producer);
@@ -478,45 +493,56 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
 
     // 当第一个监听者出现时，初始化订阅
     if (listenerManager.size === 1) {
-      // 每个订阅周期（从 0 listeners -> 1 listener）都重置 init 标记
-      initCycle += 1;
-      initStartedForCycle = false;
-
-      // 如果状态已被重置（没有监听者时会被重置），重新初始化
-      if (stateManager.getState() === RESET && stateManager.getServerValue() === RESET) {
-        const newInitialState = initializeState(producer);
-        stateManager.setState(newInitialState);
-        stateManager.setServerValue(newInitialState);
+      // If we were scheduled to go idle, cancel it and resume without reinitializing.
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
       }
 
-      // 如果存在 lastSetValueOnIdle，则还原状态
-      if (lastSetValueOnIdle) {
-        const restoredValue = lastSetValueOnIdle();
-        stateManager.setState(restoredValue);
-        // 首次订阅前仍可能在使用 server snapshot（为避免水合差异）。
-        // idle 期间的更新需要反映到首次 subscribe 的立即通知上，因此同时同步 serverValue。
-        stateManager.setServerValue(restoredValue);
-        lastSetValueOnIdle = null;
-      }
+      // Only (re)initialize when transitioning from fully inactive to active.
+      if (!isActive) {
+        // 每个订阅周期（从 0 listeners -> 1 listener）都重置 init 标记
+        initCycle += 1;
+        initStartedForCycle = false;
 
-      // 执行首次回调和开始订阅依赖
-      effectManager.executeFirstCallbacks();
-      effectManager.startSubscriptions();
+        // 如果状态已被重置（没有监听者时会被重置），重新初始化
+        if (stateManager.getState() === RESET && stateManager.getServerValue() === RESET) {
+          const newInitialState = initializeState(producer);
+          stateManager.setState(newInitialState);
+          stateManager.setServerValue(newInitialState);
+        }
 
-      // 首个订阅者出现时执行 initializer（允许 async）
-      if (initializer && !initStartedForCycle) {
-        initStartedForCycle = true;
-        const cycleAtStart = initCycle;
-        Promise.resolve()
-          .then(() => initializer!())
-          .then((value) => {
-            // 已进入新周期则忽略旧结果
-            if (cycleAtStart !== initCycle) return;
-            applyInitValue(value);
-          })
-          .catch(() => {
-            // swallow to avoid unhandled rejection; consumer can handle errors upstream
-          });
+        // 如果存在 lastSetValueOnIdle，则还原状态
+        if (lastSetValueOnIdle) {
+          const restoredValue = lastSetValueOnIdle();
+          stateManager.setState(restoredValue);
+          // 首次订阅前仍可能在使用 server snapshot（为避免水合差异）。
+          // idle 期间的更新需要反映到首次 subscribe 的立即通知上，因此同时同步 serverValue。
+          stateManager.setServerValue(restoredValue);
+          lastSetValueOnIdle = null;
+        }
+
+        // 执行首次回调和开始订阅依赖
+        effectManager.executeFirstCallbacks();
+        effectManager.startSubscriptions();
+
+        // 首个订阅者出现时执行 initializer（允许 async）
+        if (initializer && !initStartedForCycle) {
+          initStartedForCycle = true;
+          const cycleAtStart = initCycle;
+          Promise.resolve()
+            .then(() => initializer!())
+            .then((value) => {
+              // 已进入新周期则忽略旧结果
+              if (cycleAtStart !== initCycle) return;
+              applyInitValue(value);
+            })
+            .catch(() => {
+              // swallow to avoid unhandled rejection; consumer can handle errors upstream
+            });
+        }
+
+        isActive = true;
       }
     }
 
@@ -531,8 +557,26 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
 
       // 如果没有监听者了，清理资源
       if (listenerManager.isEmpty()) {
-        effectManager.clearAllSubscriptions();
-        stateManager.resetState();
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
+
+        if (idleMs <= 0) {
+          effectManager.clearAllSubscriptions();
+          stateManager.resetState();
+          isActive = false;
+          return;
+        }
+
+        idleTimer = setTimeout(() => {
+          // Only go idle if still no listeners.
+          if (!listenerManager.isEmpty()) return;
+          effectManager.clearAllSubscriptions();
+          stateManager.resetState();
+          isActive = false;
+          idleTimer = null;
+        }, idleMs);
       }
     };
   };

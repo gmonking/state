@@ -15,6 +15,7 @@ This file describes **non-negotiable semantics** and **editing constraints** for
 - `create<T>(initial: T | (() => T))` returns a `StoreLike<T>` with:
   - `getSnapshot(): T`
   - `subscribe(listener): unsubscribe`
+  - `init(initializer)`
   - `setValue(next | producer)`
   - `setServerValue(value)`
   - `_getServerSnapshot()`
@@ -42,6 +43,14 @@ When a store has no listeners:
 
 - `setValue()` must not notify
 - The **latest** idle update must be reflected on the next `subscribe()` immediate emission
+
+### 2.1) Initialization on first subscriber (`init`)
+
+- `init(() => T | Promise<T>)` registers an initializer
+- The initializer MUST run once per subscription cycle (0 listeners -> 1 listener)
+- Subscribe MUST still emit immediately with the current value first
+- When initializer resolves, its value becomes the new state and notifies subscribers once
+- After all listeners unsubscribe, a new first subscriber MUST trigger the initializer again
 
 ### 3) SSR / hydration snapshot semantics
 

@@ -111,6 +111,60 @@ describe("create() - client semantics", () => {
     u2();
   });
 
+  it("with idleMs grace period: quick unsubscribe/subscribe does not reset or rerun init", async () => {
+    vi.useFakeTimers();
+    const s = create(0, { idleMs: 1000 });
+
+    let initCalls = 0;
+    s.init(async () => {
+      initCalls += 1;
+      return initCalls;
+    });
+
+    const unsub1 = s.subscribe(() => {});
+    await vi.runAllTimersAsync();
+    expect(s.getSnapshot()).toBe(1);
+    expect(initCalls).toBe(1);
+    unsub1();
+
+    // re-subscribe before idleMs expires: should not reset or rerun init
+    vi.advanceTimersByTime(500);
+    const unsub2 = s.subscribe(() => {});
+    await vi.runAllTimersAsync();
+    expect(s.getSnapshot()).toBe(1);
+    expect(initCalls).toBe(1);
+    unsub2();
+
+    vi.useRealTimers();
+  });
+
+  it("with idleMs grace period: after idleMs expires, next first subscriber triggers init again", async () => {
+    vi.useFakeTimers();
+    const s = create(0, { idleMs: 1000 });
+
+    let initCalls = 0;
+    s.init(async () => {
+      initCalls += 1;
+      return initCalls;
+    });
+
+    const unsub1 = s.subscribe(() => {});
+    await vi.runAllTimersAsync();
+    expect(s.getSnapshot()).toBe(1);
+    unsub1();
+
+    // let cleanup happen
+    vi.advanceTimersByTime(1000);
+    await vi.runAllTimersAsync();
+
+    const unsub2 = s.subscribe(() => {});
+    await vi.runAllTimersAsync();
+    expect(s.getSnapshot()).toBe(2);
+    unsub2();
+
+    vi.useRealTimers();
+  });
+
   it("multiple listeners: removing one keeps store alive; removing last stops notifications", () => {
     const s = create(0);
     const a = vi.fn();
