@@ -38,6 +38,11 @@ type EffectListener<D extends EffectDeps, T> = (value: EffectDepValue<D>, set: S
 
 type EffectUnsubscribe = () => void;
 
+type EffectOptions = {
+  /** 允许注册依赖成环（默认 false）。启用后仍会受同步更新次数保护限制。 */
+  allowCycle?: boolean;
+};
+
 // ============================================================================
 // 类型守卫
 // ============================================================================
@@ -57,8 +62,22 @@ function isSetProducer<T>(value: unknown): value is StoreSetProducer<T> {
 /** 追踪当前正在执行 effect 的 store ID */
 let currentExecutingEffectStoreId: symbol | null = null;
 
+/** 追踪当前正在执行 subscribe listener 的 store ID */
+let currentNotifyingListenerStoreId: symbol | null = null;
+
 /** store ID 计数器 */
 let storeIdCounter = 0;
+
+/** 用于环检测：store 实例 -> storeId */
+const storeIdByStore = new WeakMap<StoreLike<any>, symbol>();
+
+/** 用于环检测：effect 依赖图（storeId -> dep storeIds） */
+const effectDepGraph = new Map<symbol, Set<symbol>>();
+
+/** 同步更新次数保护（防止成环导致的无限递归更新） */
+let syncUpdateDepth = 0;
+let syncUpdateNotifyCount = 0;
+const MAX_SYNC_NOTIFIES = 50;
 
 /**
  * 生成唯一的 store ID
@@ -75,8 +94,7 @@ type ResetSentinel = typeof RESET;
  * 在开发环境下检查是否允许在当前 store 中执行操作
  */
 function checkEffectExecutionContext(storeId: symbol): void {
-  // @ts-expect-error - process.env 在构建时处理
-  if (process.env.NODE_ENV !== 'production') {
+  if ((process as any)?.env?.NODE_ENV !== "production") {
     if (currentExecutingEffectStoreId !== null && currentExecutingEffectStoreId !== storeId) {
       throw new Error(
         "禁止在 effect 执行过程中调用其他 store 的 setValue 方法"
@@ -85,12 +103,17 @@ function checkEffectExecutionContext(storeId: symbol): void {
   }
 }
 
+function checkDisallowedOpsInEffect(op: "subscribe" | "unsubscribe" | "setServerValue"): void {
+  if (currentExecutingEffectStoreId !== null) {
+    throw new Error(`禁止在 effect 执行过程中调用 ${op}（effect 中只允许调用自身 setValue）`);
+  }
+}
+
 /**
  * 在 effect 执行过程中设置执行上下文
  */
 function withEffectContext<T>(storeId: symbol, fn: () => T): T {
-  // @ts-expect-error - process.env 在构建时处理
-  if (process.env.NODE_ENV !== 'production') {
+  if ((process as any)?.env?.NODE_ENV !== "production") {
     currentExecutingEffectStoreId = storeId;
     try {
       return fn();
@@ -99,6 +122,54 @@ function withEffectContext<T>(storeId: symbol, fn: () => T): T {
     }
   }
   return fn();
+}
+
+/**
+ * 在 listener（subscribe 回调）执行过程中禁止任何 store 的关键操作。
+ * 目的：避免重入、遍历 listeners 时修改集合、以及难以推理的同步嵌套更新。
+ */
+function checkListenerExecutionContext(): void {
+  // effect 本身可能在依赖 store 的 listener 回调中触发（通过 subscribe -> notify），
+  // 这时允许 effect 内部的 setValue 继续工作，否则 effect 将无法响应依赖变化。
+  if (currentNotifyingListenerStoreId !== null && currentExecutingEffectStoreId === null) {
+    throw new Error("禁止在 listener 执行过程中调用 subscribe / unsubscribe / setValue");
+  }
+}
+
+function withListenerContext<T>(storeId: symbol, fn: () => T): T {
+  checkListenerExecutionContext();
+  currentNotifyingListenerStoreId = storeId;
+  try {
+    return fn();
+  } finally {
+    currentNotifyingListenerStoreId = null;
+  }
+}
+
+function getOrCreateDepSet(id: symbol): Set<symbol> {
+  let deps = effectDepGraph.get(id);
+  if (!deps) {
+    deps = new Set();
+    effectDepGraph.set(id, deps);
+  }
+  return deps;
+}
+
+function wouldCreateCycle(from: symbol, to: symbol): boolean {
+  // edge: from -> to. A cycle exists if `to` can already reach `from`.
+  const stack: symbol[] = [to];
+  const seen = new Set<symbol>();
+  while (stack.length) {
+    const cur = stack.pop()!;
+    if (cur === from) return true;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    const next = effectDepGraph.get(cur);
+    if (next) {
+      next.forEach((n) => stack.push(n));
+    }
+  }
+  return false;
 }
 
 // ============================================================================
@@ -177,8 +248,9 @@ function createListenerManager<T>() {
       listeners.delete(listener);
     },
 
-    notify(value: T): void {
-      listeners.forEach((listener) => listener(value));
+    notify(value: T, run?: (listener: StoreListener<T>) => void): void {
+      const runner = run ?? ((listener: StoreListener<T>) => listener(value));
+      listeners.forEach((listener) => runner(listener));
     },
 
     hasListeners(): boolean {
@@ -247,6 +319,7 @@ function createEffectManager() {
 
 export function create<T>(producer: StoreCreateProducer<T> | T) {
   const storeId = generateStoreId();
+  let selfStore: StoreLike<T> | null = null;
 
   // 初始化状态
   const initialState = initializeState(producer);
@@ -300,13 +373,15 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
    * @param value - 服务端状态
    */
   const setServerValue = (value: T): void => {
+    checkListenerExecutionContext();
+    checkDisallowedOpsInEffect("setServerValue");
     checkEffectExecutionContext(storeId);
     stateManager.setServerValue(value);
 
     // 如果当前使用服务端值且已有监听者，需要通知他们
     // 因为 getSnapshot() 会返回新的 serverValue
     if (stateManager.isUsingServerValue() && listenerManager.hasListeners()) {
-      listenerManager.notify(value);
+      listenerManager.notify(value, (l) => withListenerContext(storeId, () => l(value)));
     }
   };
 
@@ -320,8 +395,12 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
     // 服务端不执行 set 方法
     if (isServer) return;
 
+    checkListenerExecutionContext();
     checkEffectExecutionContext(storeId);
 
+    syncUpdateDepth += 1;
+    if (syncUpdateDepth === 1) syncUpdateNotifyCount = 0;
+    try {
     // 计算新状态值
     const computeNewValue = (): T => {
       if (isSetProducer(producer)) {
@@ -343,13 +422,22 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
     // 更新状态并通知监听者
     const newValue = computeNewValue();
     stateManager.setState(newValue);
-    listenerManager.notify(newValue);
+    syncUpdateNotifyCount += 1;
+    if (syncUpdateNotifyCount > MAX_SYNC_NOTIFIES) {
+      throw new Error("同步更新次数过多，可能存在依赖成环导致的无限更新");
+    }
+    listenerManager.notify(newValue, (l) => withListenerContext(storeId, () => l(newValue)));
+    } finally {
+      syncUpdateDepth -= 1;
+    }
   };
 
   const subscribe: StoreSubscribe<T> = (listener) => {
     // 服务端不会执行 subscribe
     if (isServer) return () => {};
 
+    checkListenerExecutionContext();
+    checkDisallowedOpsInEffect("subscribe");
     // 添加监听者
     listenerManager.add(listener);
 
@@ -366,6 +454,9 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
       if (lastSetValueOnIdle) {
         const restoredValue = lastSetValueOnIdle();
         stateManager.setState(restoredValue);
+        // 首次订阅前仍可能在使用 server snapshot（为避免水合差异）。
+        // idle 期间的更新需要反映到首次 subscribe 的立即通知上，因此同时同步 serverValue。
+        stateManager.setServerValue(restoredValue);
         lastSetValueOnIdle = null;
       }
 
@@ -375,10 +466,12 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
     }
 
     // 立即通知监听者当前状态
-    listener(getSnapshot());
+    withListenerContext(storeId, () => listener(getSnapshot()));
 
     // 返回取消订阅函数
     return () => {
+      checkListenerExecutionContext();
+      checkDisallowedOpsInEffect("unsubscribe");
       listenerManager.remove(listener);
 
       // 如果没有监听者了，清理资源
@@ -401,9 +494,38 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
    * @param deps - 依赖的 store
    * @param listener - 监听器
    */
-  function effect<D extends EffectDeps>(deps: D, listener: EffectListener<D, T>): void {
+  function effect<D extends EffectDeps>(deps: D, listener: EffectListener<D, T>, options?: EffectOptions): void {
     // 服务端不会执行 effect
     if (isServer) return;
+
+    // 禁止将当前 store 作为自身 effect 的依赖（会造成循环依赖，且语义难以推理）
+    if (selfStore) {
+      for (const depStore of Object.values(deps)) {
+        if (depStore === selfStore) {
+          throw new Error("禁止将 store 作为自身 effect 的依赖");
+        }
+      }
+    }
+
+    const depIds: symbol[] = [];
+    for (const depStore of Object.values(deps)) {
+      const depId = storeIdByStore.get(depStore);
+      if (depId) depIds.push(depId);
+    }
+
+    // 依赖成环检测（默认禁止；允许时必须显式 opt-in）
+    if (!options?.allowCycle) {
+      // check if adding any edge storeId -> depId creates a cycle
+      for (const depId of depIds) {
+        if (wouldCreateCycle(storeId, depId)) {
+          throw new Error("检测到 effect 依赖成环（默认禁止）。如确有需要，请使用 { allowCycle: true } 显式允许");
+        }
+      }
+    }
+
+    // 记录依赖图边（注册时即可，不依赖是否已订阅）
+    const depSet = getOrCreateDepSet(storeId);
+    depIds.forEach((depId) => depSet.add(depId));
 
     /**
      * 首次执行 effect：聚合所有依赖的值并执行 listener
@@ -457,7 +579,7 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
     effectManager.addSubscribeStarter(subscribeToDeps);
   }
 
-  return {
+  const store = {
     getSnapshot,
     effect,
     subscribe,
@@ -465,4 +587,8 @@ export function create<T>(producer: StoreCreateProducer<T> | T) {
     setServerValue,
     _getServerSnapshot,
   } as const;
+
+  selfStore = store;
+  storeIdByStore.set(store, storeId);
+  return store;
 }
